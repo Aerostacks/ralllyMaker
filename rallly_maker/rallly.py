@@ -2,6 +2,8 @@
 
 import json
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .cdp import CdpClient, launch_chrome, wait_for_devtools, inject_cookies
 from .chrome_cookies import get_google_cookies
@@ -112,13 +114,12 @@ def _dismiss_timezone_popup(client: CdpClient):
         time.sleep(1)
 
 
-def _time_to_iso(date_str: str, time_str: str) -> str:
+def _time_to_iso(date_str: str, time_str: str, tz: str = "Europe/London") -> str:
     y, m, d = map(int, date_str.split("-"))
     h, mi = map(int, time_str.split(":"))
-    from datetime import datetime, timezone
-    # London time = UTC+1 during BST (April), so subtract 1 for UTC
-    dt = datetime(y, m, d, h - 1, mi, tzinfo=timezone.utc)
-    return dt.isoformat().replace("+00:00", "Z")
+    local = datetime(y, m, d, h, mi, tzinfo=ZoneInfo(tz))
+    utc = local.astimezone(ZoneInfo("UTC"))
+    return utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def create_poll(
@@ -148,6 +149,7 @@ def create_poll(
         logged_in = client.evaluate("(document.body?.innerText||'').includes('Lukas Lipka')")
         if not logged_in:
             _auth_rallly(client)
+            client.send("Emulation.setTimezoneOverride", {"timezoneId": tz})
             client.navigate("https://app.rallly.co/new", wait=3)
             _dismiss_timezone_popup(client)
             logged_in = client.evaluate("(document.body?.innerText||'').includes('Lukas Lipka')")
@@ -186,23 +188,26 @@ def create_poll(
             }}
         }})()""")
 
-        # Add time option rows: each date starts with 1 row, we need len(times_per_date)-1 more
+        # Add time option rows per date: each date starts with 1 row
         times_per_date = {}
         for d, t in slots:
             times_per_date.setdefault(d, []).append(t)
 
-        for _ in range(max(len(v) for v in times_per_date.values()) - 1):
-            for i in range(len(dates)):
-                _click_button(client, "Add time option", i)
+        # Add exactly the needed extra rows per date
+        for date_idx in range(len(dates)):
+            needed = len(times_per_date[dates[date_idx]]) - 1
+            for _ in range(needed):
+                _click_button(client, "Add time option", date_idx)
         time.sleep(0.5)
 
         # Set each time slot via the hidden <select> elements
-        slot_idx = 0
+        # Selects are ordered by date, each row has 2 selects (start + end)
+        select_idx = 0
         for date_str in dates:
             for t in times_per_date[date_str]:
-                iso = _time_to_iso(date_str, t)
-                _set_select(client, slot_idx * 2, iso, t)
-                slot_idx += 1
+                iso = _time_to_iso(date_str, t, tz)
+                _set_select(client, select_idx, iso, t)
+                select_idx += 2  # skip end select
 
         # Submit
         _click_button(client, "Create Poll", 0)
