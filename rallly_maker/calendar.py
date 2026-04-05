@@ -1,5 +1,7 @@
 """Extract Google Calendar events via CDP browser automation."""
 
+import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -10,112 +12,134 @@ WRAPPER_DIR = "/home/luki/codexSandbox/chrome-automation-full"
 DEBUG_PORT = 9227
 
 
-def _extract_events_js(time_min: str, time_max: str) -> str:
-    """JS that fetches calendar events via the gapi client embedded in the Calendar web app."""
-    return f"""(async () => {{
-        // Wait for the calendar to load, then scrape visible events
-        await new Promise(r => setTimeout(r, 3000));
-
-        // Try to extract from the DOM - look for event chips/elements
-        const events = [];
-        // Calendar renders events as [data-eventid] or aria-label elements
-        const chips = document.querySelectorAll('[data-eventid], [aria-label*="event"]');
-        for (const el of chips) {{
-            const label = el.getAttribute('aria-label') || el.innerText || '';
-            if (label.trim()) events.push(label.trim());
-        }}
-
-        // Also try to get from the page's internal data
-        const bodyText = (document.body?.innerText || '').slice(0, 8000);
-        return {{
-            url: location.href,
-            title: document.title,
-            eventCount: events.length,
-            events: events.slice(0, 50),
-            bodySnippet: bodyText,
-        }};
-    }})()"""
+def _handle_google_signin(client: CdpClient):
+    """If on Google sign-in, click the primary account to proceed."""
+    url = client.evaluate("location.href") or ""
+    if "accounts.google.com" not in url:
+        return
+    pt = client.evaluate("""(() => {
+        const items = document.querySelectorAll('li, div[role="link"], a');
+        for (const item of items) {
+            if ((item.innerText||'').includes('lipka.luki')) {
+                item.scrollIntoView({block:'center'});
+                const r = item.getBoundingClientRect();
+                return {x: r.left+r.width/2, y: r.top+r.height/2};
+            }
+        }
+        return null;
+    })()""")
+    if pt and pt.get("x", 0) > 0:
+        client.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": pt["x"], "y": pt["y"], "button": "left", "clickCount": 1})
+        client.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": pt["x"], "y": pt["y"], "button": "left", "clickCount": 1})
+        time.sleep(8)
 
 
-def get_events_for_range(
-    start_date: str,
-    end_date: str,
-    tz: str = "Europe/London",
-) -> list[dict]:
-    """
-    Launch Chrome, inject Google cookies, navigate to Calendar, and extract events.
-    start_date/end_date: 'YYYY-MM-DD' strings.
-    Returns list of event dicts with 'summary', 'start', 'end'.
-    """
+def _extract_events(client: CdpClient) -> list[dict]:
+    """Scrape event chips from the loaded Calendar week view."""
+    raw = client.evaluate("""(() => {
+        const results = [];
+        const chips = document.querySelectorAll('[data-eventid]');
+        for (const chip of chips) {
+            const label = chip.getAttribute('aria-label') || chip.innerText || '';
+            if (label.trim()) results.push(label.trim());
+        }
+        return results;
+    })()""")
+    return raw or []
+
+
+def _parse_event_time(label: str, cal_tz: str, target_tz: str) -> dict | None:
+    """Parse an aria-label like '3:30pm to 5:50pm, Let Londyn, ..., April 8, 2026'.
+    Times in the label are in cal_tz; we convert to target_tz."""
+    if label.lower().startswith("all day"):
+        return None
+    m = re.match(
+        r"(\d{1,2}:\d{2}(?:am|pm))\s+to\s+(\d{1,2}:\d{2}(?:am|pm)),\s*(.+?)(?:,\s*(?:Calendar:.*?,\s*)?(?:No location,\s*)?(\w+ \d{1,2}(?:,\s*\d{4}| – \d{1,2},\s*\d{4})))",
+        label, re.IGNORECASE,
+    )
+    if not m:
+        return None
+    start_str, end_str, summary = m.group(1), m.group(2), m.group(3).strip()
+    date_part = m.group(4).strip()
+    date_m = re.search(r"(\w+)\s+(\d{1,2}),?\s*(\d{4})", date_part)
+    if not date_m:
+        return None
+    try:
+        date = datetime.strptime(f"{date_m.group(1)} {date_m.group(2)} {date_m.group(3)}", "%B %d %Y")
+    except ValueError:
+        return None
+
+    def parse_time(s):
+        return datetime.strptime(s.upper(), "%I:%M%p")
+
+    st = parse_time(start_str)
+    et = parse_time(end_str)
+
+    # Convert from calendar display tz to target tz
+    cal_zone = ZoneInfo(cal_tz)
+    tgt_zone = ZoneInfo(target_tz)
+    start_dt = date.replace(hour=st.hour, minute=st.minute, tzinfo=cal_zone).astimezone(tgt_zone)
+    end_dt = date.replace(hour=et.hour, minute=et.minute, tzinfo=cal_zone).astimezone(tgt_zone)
+
+    return {
+        "summary": summary,
+        "date": start_dt.strftime("%Y-%m-%d"),
+        "start": start_dt.strftime("%H:%M"),
+        "end": end_dt.strftime("%H:%M"),
+    }
+
+
+def get_events_for_range(start_date: str, end_date: str, tz: str = "Europe/London") -> list[dict]:
+    """Launch Chrome, navigate to Calendar, extract timed events."""
+    # Detect the system/calendar display timezone
+    import subprocess
+    try:
+        cal_tz = subprocess.check_output(["timedatectl", "show", "-p", "Timezone", "--value"], text=True).strip()
+    except Exception:
+        cal_tz = "Europe/Bratislava"
+
     cookies = get_google_cookies()
-    proc = launch_chrome(WRAPPER_DIR, DEBUG_PORT)
+    proc = launch_chrome(WRAPPER_DIR, DEBUG_PORT, ["--remote-allow-origins=*"])
     try:
         ws_url = wait_for_devtools(DEBUG_PORT)
         client = CdpClient(ws_url)
         client.send("Page.enable")
         client.send("Runtime.enable")
         inject_cookies(client, cookies)
+        client.navigate(f"https://calendar.google.com/calendar/u/0/r/week/{start_date.replace('-', '/')}", wait=5)
+        _handle_google_signin(client)
 
-        # Navigate to calendar week view for the target dates
-        # Use the /r/week/ view with a specific date
-        cal_url = f"https://calendar.google.com/calendar/u/0/r/week/{start_date.replace('-', '/')}"
-        client.navigate(cal_url, wait=5)
-
-        state = client.evaluate("""(() => ({
-            url: location.href,
-            title: document.title,
-            loggedIn: !location.href.includes('accounts.google.com'),
-            bodySnippet: (document.body?.innerText || '').slice(0, 4000),
-        }))()""")
-
-        if not state or not state.get("loggedIn"):
-            return _parse_events_from_text(state.get("bodySnippet", "") if state else "", start_date, end_date, tz)
-
-        # Extract events from the rendered calendar
-        raw = client.evaluate(_extract_events_js(start_date, end_date))
+        labels = _extract_events(client)
         client.close()
 
-        if raw and raw.get("events"):
-            return _parse_aria_events(raw["events"], tz)
-        # Fall back to parsing body text
-        return _parse_events_from_text(
-            raw.get("bodySnippet", "") if raw else "",
-            start_date, end_date, tz,
-        )
+        events = []
+        for label in labels:
+            parsed = _parse_event_time(label, cal_tz, tz)
+            if parsed:
+                events.append(parsed)
+        return events
     finally:
         proc.kill()
         proc.wait()
 
 
-def _parse_aria_events(labels: list[str], tz: str) -> list[dict]:
-    """Parse aria-label strings like 'Meeting, April 7, 2026, 5:00 – 6:00 PM'."""
-    events = []
-    for label in labels:
-        events.append({"summary": label, "raw": True})
-    return events
-
-
-def _parse_events_from_text(text: str, start_date: str, end_date: str, tz: str) -> list[dict]:
-    """Best-effort parse of calendar body text for timed events."""
-    # This is a fallback — returns empty if we can't parse
-    return []
-
-
 def find_conflicts(
     events: list[dict],
-    start_date: str,
-    end_date: str,
     slot_starts: list[str] = ("16:30", "17:00", "17:30", "18:00"),
     tz: str = "Europe/London",
-) -> list[str]:
-    """
-    Given events and a date range, return slot strings that conflict.
-    Slot format: 'YYYY-MM-DD HH:MM'.
-    If no events have parseable times, returns empty (no conflicts).
-    """
-    # For now, with raw aria-label events, we can't reliably parse times
-    # Return empty = no conflicts detected
-    return []
+) -> set[str]:
+    """Return set of 'YYYY-MM-DD HH:MM' slot keys that overlap with events."""
+    conflicts = set()
+    for ev in events:
+        ev_start = int(ev["start"].replace(":", ""))
+        ev_end = int(ev["end"].replace(":", ""))
+        for t in slot_starts:
+            slot_start = int(t.replace(":", ""))
+            slot_end = slot_start + 100  # 1 hour later
+            # Overlap check
+            if slot_start < ev_end and ev_start < slot_end:
+                conflicts.add(f"{ev['date']} {t}")
+    return conflicts
 
 
 def available_slots(
@@ -124,12 +148,9 @@ def available_slots(
     slot_starts: list[str] = ("16:30", "17:00", "17:30", "18:00"),
     tz: str = "Europe/London",
 ) -> list[tuple[str, str]]:
-    """
-    Return list of (date, time) tuples for all available slots.
-    Fetches calendar, removes conflicts.
-    """
+    """Return (date, time) tuples for all available slots after removing calendar conflicts."""
     events = get_events_for_range(start_date, end_date, tz)
-    conflicts = find_conflicts(events, start_date, end_date, slot_starts, tz)
+    conflicts = find_conflicts(events, slot_starts, tz)
 
     slots = []
     d = datetime.strptime(start_date, "%Y-%m-%d")
@@ -137,8 +158,7 @@ def available_slots(
     while d <= end:
         ds = d.strftime("%Y-%m-%d")
         for t in slot_starts:
-            key = f"{ds} {t}"
-            if key not in conflicts:
+            if f"{ds} {t}" not in conflicts:
                 slots.append((ds, t))
         d += timedelta(days=1)
     return slots

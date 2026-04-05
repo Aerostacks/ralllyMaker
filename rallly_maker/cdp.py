@@ -88,6 +88,7 @@ def launch_chrome(wrapper_dir: str, debug_port: int = 9222, extra_args: list | N
         "--disable-gpu",
         "--no-first-run",
         "--no-default-browser-check",
+        "--remote-allow-origins=*",
         "about:blank",
     ]
     if extra_args:
